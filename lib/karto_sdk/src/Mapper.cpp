@@ -32,6 +32,8 @@
 #include <utility>
 #include <algorithm>
 #include <string>
+#include <cmath>    // std::isnan, std::isinf (for GPU branch)
+#include <limits>   // std::numeric_limits  (for GPU branch)
 
 #include "karto_sdk/Mapper.h"
 
@@ -716,6 +718,100 @@ kt_double ScanMatcher::CorrelateScan(
   kt_double searchAngleOffset, kt_double searchAngleResolution,
   kt_bool doPenalize, Pose2 & rMean, Matrix3 & rCovariance, kt_bool doingFineMatch)
 {
+  // ===========================================================================
+  // GPU ACCELERATION BRANCH — single guarded entry point.
+  // The existing CPU code below is UNTOUCHED; this block only runs when
+  // a GPU backend has been registered AND reports itself available.
+  // On any GPU failure correlateScan() returns -1.0 and we fall through.
+  // ===========================================================================
+  if (m_pGpuCorrelator != nullptr && m_pGpuCorrelator->isAvailable()) {
+    // -- 1. Extract pScan local-frame points ----------------------------------
+    // Mirrors GridIndexLookup::ComputeOffsets: InverseTransformPose on each
+    // point reading.  NaN marks invalid readings (= INVALID_SCAN on GPU).
+    const PointVectorDouble & rPointReadings = pScan->GetPointReadings();
+    const int nPoints = static_cast<int>(rPointReadings.size());
+    std::vector<float> localPts(nPoints * 2);
+    {
+      Transform scanTransform(pScan->GetSensorPose());
+      const kt_double * pRanges = pScan->GetRangeReadings();
+      int pi = 0;
+      for (PointVectorDouble::const_iterator it = rPointReadings.begin();
+           it != rPointReadings.end(); ++it, ++pi)
+      {
+        if (std::isnan(pRanges[pi]) || std::isinf(pRanges[pi])) {
+          localPts[pi * 2]     = std::numeric_limits<float>::quiet_NaN();
+          localPts[pi * 2 + 1] = std::numeric_limits<float>::quiet_NaN();
+        } else {
+          Pose2 lp = scanTransform.InverseTransformPose(Pose2(*it, 0.0));
+          localPts[pi * 2]     = static_cast<float>(lp.GetX());
+          localPts[pi * 2 + 1] = static_cast<float>(lp.GetY());
+        }
+      }
+    }
+
+    // -- 2. Pack CorrelateScan arguments into GpuCorrelationCallParams --------
+    karto::GpuCorrelationCallParams gp;
+    gp.localPointsXY     = localPts.data();
+    gp.nPoints           = nPoints;
+
+    gp.corrGridData      = m_pCorrelationGrid->GetDataPointer();
+    gp.gridWidth         = m_pCorrelationGrid->GetWidth();
+    gp.gridHeight        = m_pCorrelationGrid->GetHeight();
+    gp.gridWidthStep     = m_pCorrelationGrid->GetWidthStep();
+    gp.gridDataSize      = m_pCorrelationGrid->GetDataSize();
+    gp.gridScale         = static_cast<float>(
+      m_pCorrelationGrid->GetCoordinateConverter()->GetScale());
+    gp.gridOffsetX       = static_cast<float>(
+      m_pCorrelationGrid->GetCoordinateConverter()->GetOffset().GetX());
+    gp.gridOffsetY       = static_cast<float>(
+      m_pCorrelationGrid->GetCoordinateConverter()->GetOffset().GetY());
+    gp.roiOffsetX        = m_pCorrelationGrid->GetROI().GetX();
+    gp.roiOffsetY        = m_pCorrelationGrid->GetROI().GetY();
+
+    gp.searchCenterX     = static_cast<float>(rSearchCenter.GetX());
+    gp.searchCenterY     = static_cast<float>(rSearchCenter.GetY());
+    gp.searchCenterTheta = static_cast<float>(rSearchCenter.GetHeading());
+    gp.searchAngleOffset = static_cast<float>(searchAngleOffset);
+    gp.searchAngleResolution  = static_cast<float>(searchAngleResolution);
+    gp.searchSpaceOffsetX     = static_cast<float>(rSearchSpaceOffset.GetX());
+    gp.searchSpaceOffsetY     = static_cast<float>(rSearchSpaceOffset.GetY());
+    gp.searchSpaceResolutionX = static_cast<float>(rSearchSpaceResolution.GetX());
+    gp.searchSpaceResolutionY = static_cast<float>(rSearchSpaceResolution.GetY());
+
+    gp.doPenalize           = (doPenalize != 0);
+    gp.distVariancePenalty  = static_cast<float>(
+      m_pMapper->m_pDistanceVariancePenalty->GetValue());
+    gp.angleVariancePenalty = static_cast<float>(
+      m_pMapper->m_pAngleVariancePenalty->GetValue());
+    gp.minDistPenalty       = static_cast<float>(
+      m_pMapper->m_pMinimumDistancePenalty->GetValue());
+    gp.minAnglePenalty      = static_cast<float>(
+      m_pMapper->m_pMinimumAnglePenalty->GetValue());
+    gp.doingFineMatch       = (doingFineMatch != 0);
+
+    // -- 3. Run GPU pipeline --------------------------------------------------
+    double meanX = 0.0, meanY = 0.0, meanTheta = 0.0;
+    double covData[9] = {};
+
+    double gpuResult = m_pGpuCorrelator->correlateScan(
+      gp, &meanX, &meanY, &meanTheta, covData);
+
+    if (gpuResult >= 0.0) {
+      // GPU succeeded: write outputs and return — CPU path is skipped.
+      rMean = Pose2(meanX, meanY, meanTheta);
+      rCovariance(0, 0) = covData[0]; rCovariance(0, 1) = covData[1];
+      rCovariance(0, 2) = covData[2]; rCovariance(1, 0) = covData[3];
+      rCovariance(1, 1) = covData[4]; rCovariance(1, 2) = covData[5];
+      rCovariance(2, 0) = covData[6]; rCovariance(2, 1) = covData[7];
+      rCovariance(2, 2) = covData[8];
+      return static_cast<kt_double>(gpuResult);
+    }
+    // gpuResult == -1.0 → failure logged inside correlateScan(); fall through.
+  }
+  // ===========================================================================
+  // END GPU BRANCH — CPU path follows, completely unchanged.
+  // ===========================================================================
+
   assert(searchAngleResolution != 0.0);
 
   // setup lookup arrays

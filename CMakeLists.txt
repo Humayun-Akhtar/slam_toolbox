@@ -21,6 +21,15 @@ find_package(visualization_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
+# tf2_sensor_msgs 0.25.20 (Humble) is header-only and exports no imported
+# target.  Create a stub INTERFACE target so the upstream target_link_libraries
+# calls that reference tf2_sensor_msgs::tf2_sensor_msgs resolve without error.
+if(NOT TARGET tf2_sensor_msgs::tf2_sensor_msgs)
+  add_library(tf2_sensor_msgs::tf2_sensor_msgs INTERFACE IMPORTED)
+  target_include_directories(tf2_sensor_msgs::tf2_sensor_msgs INTERFACE
+    ${tf2_sensor_msgs_INCLUDE_DIRS}
+  )
+endif()
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
@@ -98,7 +107,72 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 add_definitions(-DQT_NO_KEYWORDS)
 find_package(Boost REQUIRED system serialization filesystem thread)
 
+# ---------------------------------------------------------------------------
+# Optional CUDA support
+# ---------------------------------------------------------------------------
+# We use check_language() rather than find_package(CUDA) so that the entire
+# GPU code path compiles out silently when no CUDA Toolkit is installed.
+# The variable SLAM_TOOLBOX_CUDA_AVAILABLE is written into gpu_config.h by
+# configure_file(); it is the single source of truth used by every header
+# and source file in this project.
+include(CheckLanguage)
+check_language(CUDA)
+
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)  # must follow enable_language(CUDA); provides CUDA::cudart, CUDA::cuda_driver
+  message(STATUS "slam_toolbox: CUDA Toolkit found — GPU scan matching ENABLED")
+  message(STATUS "slam_toolbox: CUDA compiler: ${CMAKE_CUDA_COMPILER}")
+
+  # -------------------------------------------------------------------------
+  # Minimum GPU architecture: sm_60 (Pascal).
+  # atomicAdd(double*) is UNDEFINED BEHAVIOR below sm_60 — it silently
+  # compiles but produces incorrect results on Kepler/Maxwell hardware
+  # (sm_35, sm_50, sm_52, sm_53).  Reject any user-supplied list that
+  # includes a sub-60 arch to prevent hard-to-diagnose numeric corruption.
+  # -------------------------------------------------------------------------
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    # Default: Turing through Ampere for nvcc 11.5 compatibility.
+    # sm_89 requires newer toolchains and breaks builds on CUDA 11.5.
+    set(CMAKE_CUDA_ARCHITECTURES 75 86)
+  else()
+    # User supplied a list — validate every entry.
+    foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+      if(_arch LESS 60)
+        message(FATAL_ERROR
+          "slam_toolbox: CMAKE_CUDA_ARCHITECTURES contains sm_${_arch}, "
+          "which is below the required minimum of sm_60.  "
+          "atomicAdd(double*) is undefined behaviour on sm_${_arch} and "
+          "will produce silently wrong scan-match responses.  "
+          "Remove sm_${_arch} from CMAKE_CUDA_ARCHITECTURES and re-run cmake.")
+      endif()
+    endforeach()
+  endif()
+
+  # Propagate C++17 to device code.
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+  # Treat CUDA warnings the same way as CXX warnings.
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Wall")
+
+  set(SLAM_TOOLBOX_CUDA_AVAILABLE TRUE)
+else()
+  message(STATUS "slam_toolbox: CUDA Toolkit NOT found — GPU scan matching DISABLED")
+  set(SLAM_TOOLBOX_CUDA_AVAILABLE FALSE)
+endif()
+
+# Generate include/slam_toolbox/gpu_config.h from the .in template.
+# The file is written into the build tree and added to the include path below.
+configure_file(
+  cmake/gpu_config.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/slam_toolbox/gpu_config.h
+  @ONLY
+)
+# ---------------------------------------------------------------------------
+
 include_directories(include lib/karto_sdk/include
+                            ${CMAKE_CURRENT_BINARY_DIR}/include
                             ${EIGEN3_INCLUDE_DIRS}
                             ${CHOLMOD_INCLUDE_DIR}
                             ${Boost_INCLUDE_DIRS}
@@ -208,6 +282,52 @@ rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typ
 target_link_libraries(ceres_solver_plugin PUBLIC "${cpp_typesupport_target}")
 pluginlib_export_plugin_description_file(slam_toolbox solver_plugins.xml)
 
+#### GPU scan-matching backend (compiled only when CUDA is available)
+# The library contains gpu_scan_correlation_backend.cu and nothing else.
+# Non-CUDA builds skip this block entirely; toolbox_common does NOT link
+# to gpu_correlation_backend in that case, so zero CUDA symbols are present.
+if(SLAM_TOOLBOX_CUDA_AVAILABLE)
+  add_library(gpu_correlation_backend
+    src/gpu_scan_correlation_backend.cu
+  )
+  # Explicit property-form CUDA standard (required for nvcc on CMake < 3.18)
+  set_property(TARGET gpu_correlation_backend PROPERTY CUDA_STANDARD 17)
+  set_target_properties(gpu_correlation_backend PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF      # only one TU; no device linking needed
+    POSITION_INDEPENDENT_CODE ON
+  )
+  # Workaround for nvcc 11.5 + GCC 11 parameter-pack errors from
+  # /usr/include/c++/11/bits/std_function.h when compiling in C++17 mode.
+  # --expt-relaxed-constexpr  : silences constexpr-in-device-context errors
+  #                             that GCC 11 headers trigger in nvcc 11.5
+  # -Xcompiler -std=c++17     : explicitly pass the C++17 dialect to the host
+  #                             compiler (nvcc 11.5 does not always forward it)
+  # --generate-code ...       : explicit virtual arch/code for sm_61 to avoid
+  #                             nvcc 11.5 defaulting to an incompatible arch
+  target_compile_options(gpu_correlation_backend PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr
+      -Xcompiler=-std=c++17
+      --generate-code=arch=compute_61,code=sm_61
+    >
+  )
+  target_include_directories(gpu_correlation_backend PUBLIC
+    include
+    ${CMAKE_CURRENT_BINARY_DIR}/include  # for generated gpu_config.h
+    lib/karto_sdk/include
+    ${EIGEN3_INCLUDE_DIRS}
+  )
+  target_link_libraries(gpu_correlation_backend PUBLIC
+    kartoSlamToolbox
+    CUDA::cudart          # -lcudart, device runtime
+    CUDA::cuda_driver     # -lcuda, driver API (for capability queries)
+  )
+  # Let kartoSlamToolbox know GPU is present so Mapper.cpp compiles the branch
+  target_compile_definitions(kartoSlamToolbox PUBLIC KARTO_GPU_AVAILABLE)
+  # Export so downstream packages can link against the GPU backend.
+  list(APPEND libraries gpu_correlation_backend)
+endif()
+
 #### Tool lib for mapping
 add_library(toolbox_common src/slam_toolbox_common.cpp src/map_saver.cpp src/loop_closure_assistant.cpp src/loop_closure_listener.cpp src/laser_utils.cpp src/slam_mapper.cpp)
 target_link_libraries(toolbox_common PUBLIC
@@ -238,6 +358,12 @@ target_link_libraries(toolbox_common PUBLIC
   tf2_sensor_msgs::tf2_sensor_msgs
 )
 target_link_libraries(toolbox_common PUBLIC kartoSlamToolbox ${Boost_LIBRARIES})
+# Link the GPU backend into toolbox_common when available.
+# unit in toolbox_common that includes scan_correlation_backend_factory.hpp
+# will then automatically find the GPU symbols at link time.
+if(SLAM_TOOLBOX_CUDA_AVAILABLE)
+  target_link_libraries(toolbox_common PUBLIC gpu_correlation_backend)
+endif()
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(toolbox_common PUBLIC "${cpp_typesupport_target}")
 
@@ -315,6 +441,11 @@ install(TARGETS SlamToolboxPlugin
   INCLUDES DESTINATION include
 )
 
+# Install the generated gpu_config.h alongside the rest of the headers.
+install(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/include/slam_toolbox/gpu_config.h
+  DESTINATION include/slam_toolbox
+)
 install(DIRECTORY include/
   DESTINATION include
 )

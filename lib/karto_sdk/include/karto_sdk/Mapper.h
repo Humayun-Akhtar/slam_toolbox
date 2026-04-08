@@ -35,6 +35,10 @@
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "Karto.h"  // NOLINT
 #include "nanoflann_adaptors.h"  // NOLINT
+// Optional GPU acceleration interface — pure C++, no CUDA symbols.
+// Included unconditionally; the concrete implementation only exists when
+// KARTO_GPU_AVAILABLE is defined (set by CMake when CUDA is found).
+#include "GpuCorrelation.h"  // NOLINT
 
 
 namespace karto
@@ -1437,6 +1441,28 @@ public:
     return m_pCorrelationGrid;
   }
 
+  // ---------------------------------------------------------------------------
+  // Optional GPU correlation backend — additive, zero effect when nullptr.
+  // Set by slam_toolbox at node startup via SMapper::configure().
+  // The pointer is NOT owned by ScanMatcher; the backend object outlives it.
+  // ---------------------------------------------------------------------------
+  /**
+   * Registers a GPU correlation handle to be used inside CorrelateScan.
+   * Pass nullptr to disable GPU acceleration.
+   * @param pHandle  Pointer to a GpuCorrelationHandle implementation,
+   *                 or nullptr to disable.
+   */
+  inline void SetGpuCorrelationHandle(karto::GpuCorrelationHandle * pHandle)
+  {
+    m_pGpuCorrelator = pHandle;
+  }
+
+  /** @return the currently registered GPU handle, or nullptr. */
+  inline karto::GpuCorrelationHandle * GetGpuCorrelationHandle() const
+  {
+    return m_pGpuCorrelator;
+  }
+
 private:
   /**
    * Marks cells where scans' points hit as being occupied
@@ -1501,6 +1527,8 @@ private:
   kt_int32u m_nAngles;
   kt_double m_searchAngleResolution;
   kt_bool m_doPenalize;
+  // GPU backend — non-owning nullable pointer (additive, never serialized).
+  karto::GpuCorrelationHandle * m_pGpuCorrelator = nullptr;
 
   /**
    * Serialization: class ScanMatcher
